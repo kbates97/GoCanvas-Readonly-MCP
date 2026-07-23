@@ -3,18 +3,27 @@
 Exposes read-only (GET) endpoints of the GoCanvas API v3 as MCP tools, scoped to
 Forms, Submissions, Reports, and Reference Data.
 
-Authentication is provided via environment variables, in priority order:
+Authentication is resolved per request, in priority order:
+  * Incoming ``Authorization`` header on the MCP request -> forwarded verbatim to
+        the GoCanvas API. This is the passthrough mode used when the server is
+        hosted publicly (e.g. behind a Microsoft 365 Copilot custom agent that
+        performs its own OAuth flow). No server-side credentials are required.
   * GOCANVAS_CLIENT_ID + GOCANVAS_CLIENT_SECRET -> OAuth 2.0 client-credentials.
         A short-lived bearer token is fetched from /oauth/token on startup,
         cached until it expires, and re-fetched automatically (or on a 401).
-  * GOCANVAS_API_TOKEN                          -> static Bearer token.
+  * GOCANVAS_API_TOKEN                          -> static bearer token.
   * GOCANVAS_USERNAME + GOCANVAS_PASSWORD       -> HTTP Basic auth (fallback).
+
+The server starts even when no credentials are configured; the "no credentials"
+error is only raised when a tool is actually called without any usable auth.
 
 Optional environment variables:
   * GOCANVAS_BASE_URL   (default: https://api.gocanvas.com/api/v3)
   * GOCANVAS_OAUTH_SCOPE (default: unset)         scope requested for the token
-  * GOCANVAS_PDF_DIR    (default: ./pdf_output)  directory for downloaded PDFs
   * GOCANVAS_TIMEOUT    (default: 30)            HTTP timeout in seconds
+  * GOCANVAS_TRANSPORT  (default: stdio)         stdio | streamable-http | sse
+  * GOCANVAS_HOST       (default: 127.0.0.1)     bind host for HTTP transports
+  * GOCANVAS_PORT       (default: 8000)          bind port for HTTP transports
 """
 
 from __future__ import annotations
@@ -22,8 +31,6 @@ from __future__ import annotations
 import base64
 import os
 import time
-import uuid
-from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -36,8 +43,10 @@ CLIENT_SECRET = os.environ.get("GOCANVAS_CLIENT_SECRET")
 OAUTH_SCOPE = os.environ.get("GOCANVAS_OAUTH_SCOPE")
 USERNAME = os.environ.get("GOCANVAS_USERNAME")
 PASSWORD = os.environ.get("GOCANVAS_PASSWORD")
-PDF_DIR = os.environ.get("GOCANVAS_PDF_DIR", "./pdf_output")
 TIMEOUT = float(os.environ.get("GOCANVAS_TIMEOUT", "30"))
+TRANSPORT = os.environ.get("GOCANVAS_TRANSPORT", "stdio").strip().lower()
+HTTP_HOST = os.environ.get("GOCANVAS_HOST", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("GOCANVAS_PORT", "8000"))
 
 # Refresh an OAuth token this many seconds before its stated expiry.
 _TOKEN_EXPIRY_SKEW = 60.0
@@ -125,8 +134,35 @@ def _ensure_oauth_token(force: bool = False) -> str:
     return token
 
 
+def _incoming_bearer() -> Optional[str]:
+    """Return the raw ``Authorization`` header from the current MCP request.
+
+    Only meaningful under an HTTP transport (streamable-http / sse), where a
+    public caller such as a Microsoft 365 Copilot custom agent forwards its own
+    OAuth bearer token. Returns ``None`` for stdio or when no header is present.
+    """
+    try:
+        request = mcp.get_context().request_context.request
+    except Exception:  # noqa: BLE001 - no active/HTTP request context
+        return None
+    if request is None:
+        return None
+    try:
+        header = request.headers.get("authorization")
+    except Exception:  # noqa: BLE001 - non-HTTP request object
+        return None
+    return header or None
+
+
 def _auth_headers() -> dict[str, str]:
-    """Build the Authorization header from configured credentials."""
+    """Build the Authorization header used for GoCanvas API calls.
+
+    Priority: forwarded request bearer (passthrough) -> server-side OAuth
+    client-credentials -> static API token -> HTTP Basic auth.
+    """
+    incoming = _incoming_bearer()
+    if incoming:
+        return {"Authorization": incoming}
     if _oauth_configured():
         return {"Authorization": f"Bearer {_ensure_oauth_token()}"}
     if API_TOKEN:
@@ -135,9 +171,9 @@ def _auth_headers() -> dict[str, str]:
         raw = f"{USERNAME}:{PASSWORD}".encode("utf-8")
         return {"Authorization": "Basic " + base64.b64encode(raw).decode("ascii")}
     raise RuntimeError(
-        "No GoCanvas credentials configured. Set GOCANVAS_CLIENT_ID and "
-        "GOCANVAS_CLIENT_SECRET (OAuth), GOCANVAS_API_TOKEN, or both "
-        "GOCANVAS_USERNAME and GOCANVAS_PASSWORD."
+        "No GoCanvas credentials available. Provide an Authorization header on the "
+        "request, or set GOCANVAS_CLIENT_ID and GOCANVAS_CLIENT_SECRET (OAuth), "
+        "GOCANVAS_API_TOKEN, or both GOCANVAS_USERNAME and GOCANVAS_PASSWORD."
     )
 
 
@@ -230,18 +266,18 @@ def _get_json(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, A
     return result
 
 
-def _download_pdf(path: str, filename_hint: str) -> dict[str, Any]:
-    """GET a binary PDF endpoint, save it to disk, and return the saved path."""
+def _get_pdf(path: str) -> dict[str, Any]:
+    """GET a binary PDF endpoint and return its bytes inline as base64.
+
+    The server acts purely as a passthrough (no local filesystem writes), so this
+    works on read-only / ephemeral hosts such as AWS Lambda.
+    """
     response = _request("GET", path, accept="application/pdf")
-    out_dir = Path(PDF_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{filename_hint}-{uuid.uuid4().hex[:8]}.pdf"
-    out_path = out_dir / filename
-    out_path.write_bytes(response.content)
+    content = response.content
     return {
-        "saved_path": str(out_path.resolve()),
+        "content_base64": base64.b64encode(content).decode("ascii"),
         "content_type": response.headers.get("content-type", "application/pdf"),
-        "size_bytes": len(response.content),
+        "size_bytes": len(content),
     }
 
 
@@ -392,14 +428,12 @@ def get_form_report(form_id: int, report_id: int) -> dict[str, Any]:
 
 @mcp.tool()
 def get_submission_default_pdf(submission_id: int) -> dict[str, Any]:
-    """Download the default Report PDF for a Submission and return the saved file path.
+    """Download the default Report PDF for a Submission and return its bytes inline as base64.
 
     Args:
         submission_id: The identifier of the Submission.
     """
-    return _download_pdf(
-        f"/submissions/{submission_id}/pdf", f"submission-{submission_id}-default"
-    )
+    return _get_pdf(f"/submissions/{submission_id}/pdf")
 
 
 @mcp.tool()
@@ -410,23 +444,17 @@ def get_submission_report_pdf(submission_id: int, report_id: int) -> dict[str, A
         submission_id: The identifier of the Submission.
         report_id: The identifier of the Report definition to render.
     """
-    return _download_pdf(
-        f"/submissions/{submission_id}/reports/{report_id}",
-        f"submission-{submission_id}-report-{report_id}",
-    )
+    return _get_pdf(f"/submissions/{submission_id}/reports/{report_id}")
 
 
 @mcp.tool()
 def get_submission_standard_pdf(submission_id: int) -> dict[str, Any]:
-    """Download the Standard Report PDF for a Submission and return the saved file path.
+    """Download the Standard Report PDF for a Submission and return its bytes inline as base64.
 
     Args:
         submission_id: The identifier of the Submission.
     """
-    return _download_pdf(
-        f"/submissions/{submission_id}/standard_pdf",
-        f"submission-{submission_id}-standard",
-    )
+    return _get_pdf(f"/submissions/{submission_id}/standard_pdf")
 
 
 # --------------------------------------------------------------------------- #
@@ -479,13 +507,19 @@ def refresh_oauth_token() -> dict[str, Any]:
 
 
 def main() -> None:
-    # Best-effort: obtain an OAuth token on startup so the first tool call is fast.
+    # Best-effort: obtain a server-side OAuth token on startup so the first tool
+    # call is fast. Skipped when client-credentials are not configured (e.g. pure
+    # passthrough hosting) and never fatal.
     if _oauth_configured():
         try:
             _ensure_oauth_token()
         except Exception:  # noqa: BLE001 - startup fetch is best-effort
             pass
-    mcp.run()
+
+    if TRANSPORT in ("streamable-http", "sse"):
+        mcp.settings.host = HTTP_HOST
+        mcp.settings.port = HTTP_PORT
+    mcp.run(transport=TRANSPORT)
 
 
 if __name__ == "__main__":
