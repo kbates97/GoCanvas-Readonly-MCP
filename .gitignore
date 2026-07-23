@@ -1,6 +1,5 @@
 .venv/
 __pycache__/
 *.pyc
-pdf_output/
 .env
 .DS_Store

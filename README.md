@@ -32,8 +32,9 @@ Reference Data**. No create/update/delete operations are exposed.
 | `get_submission_report_pdf` | `GET /submissions/{submission_id}/reports/{report_id}` (PDF) |
 | `get_submission_standard_pdf` | `GET /submissions/{submission_id}/standard_pdf` (PDF) |
 
-The three PDF tools download the binary response to `GOCANVAS_PDF_DIR`
-(default `./pdf_output`) and return the saved file path, content type, and size.
+The three PDF tools return the binary PDF **inline as base64** (`content_base64`,
+`content_type`, `size_bytes`) — the server is a pure passthrough and never writes
+to disk, so the tools work on read-only / ephemeral hosts such as AWS Lambda.
 
 ### Reference Data
 | Tool | Endpoint |
@@ -46,10 +47,13 @@ The three PDF tools download the binary response to `GOCANVAS_PDF_DIR`
 | --- | --- |
 | `refresh_oauth_token` | `POST /oauth/token` (client-credentials) |
 
-`refresh_oauth_token` forces a fresh bearer token to be fetched and cached. It is
-normally unnecessary — the server fetches a token on startup and refreshes it
-automatically before expiry and on a `401` — but it is exposed so the agent can
-rotate the token explicitly. The returned access token is masked.
+`refresh_oauth_token` forces a fresh bearer token to be fetched and cached. It
+only applies to **server-side OAuth** (`GOCANVAS_CLIENT_ID` /
+`GOCANVAS_CLIENT_SECRET`) mode; in passthrough mode the caller owns the token and
+the server cannot refresh it. It is normally unnecessary — the server fetches a
+token on startup and refreshes it automatically before expiry and on a `401` — but
+it is exposed so the agent can rotate the token explicitly. The returned access
+token is masked.
 
 ## Setup
 
@@ -74,26 +78,54 @@ pip install -r requirements.txt
 
 ## Configuration
 
-Set credentials via environment variables (see `.env.example`). Authentication is
-resolved in the following priority order:
+The server is a thin passthrough to the GoCanvas API and **starts with no
+credentials configured**. Authentication is resolved **per request**, in the
+following priority order:
+
+| Source | Description |
+| --- | --- |
+| Incoming `Authorization` header | Forwarded verbatim to the GoCanvas API. This is the passthrough mode used when the server is hosted publicly behind a caller that performs its own OAuth flow (e.g. a Microsoft 365 Copilot custom agent). No server-side credentials are needed. |
+| `GOCANVAS_CLIENT_ID` / `GOCANVAS_CLIENT_SECRET` | OAuth 2.0 client credentials. A short-lived bearer token is fetched from `/oauth/token`, cached, and auto-refreshed on expiry or `401`. |
+| `GOCANVAS_API_TOKEN` | Static bearer token. |
+| `GOCANVAS_USERNAME` / `GOCANVAS_PASSWORD` | HTTP Basic auth (fallback). |
+
+Other optional variables:
 
 | Variable | Description |
 | --- | --- |
-| `GOCANVAS_CLIENT_ID` / `GOCANVAS_CLIENT_SECRET` | OAuth 2.0 client credentials (preferred). A short-lived bearer token is fetched from `/oauth/token`, cached, and auto-refreshed on expiry or `401`. |
-| `GOCANVAS_OAUTH_SCOPE` | Optional OAuth scope to request. |
-| `GOCANVAS_API_TOKEN` | Static bearer token. |
-| `GOCANVAS_USERNAME` / `GOCANVAS_PASSWORD` | HTTP Basic auth (fallback). |
-| `GOCANVAS_BASE_URL` | Optional. Defaults to `https://api.gocanvas.com/api/v3`. |
-| `GOCANVAS_PDF_DIR` | Optional. Output directory for downloaded PDFs (default `./pdf_output`). |
-| `GOCANVAS_TIMEOUT` | Optional. HTTP timeout in seconds (default `30`). |
+| `GOCANVAS_OAUTH_SCOPE` | Optional OAuth scope to request (server-side OAuth only). |
+| `GOCANVAS_BASE_URL` | Defaults to `https://api.gocanvas.com/api/v3`. |
+| `GOCANVAS_TIMEOUT` | HTTP timeout in seconds (default `30`). |
+| `GOCANVAS_TRANSPORT` | `stdio` (default), `streamable-http`, or `sse`. |
+| `GOCANVAS_HOST` | Bind host for HTTP transports (default `127.0.0.1`). |
+| `GOCANVAS_PORT` | Bind port for HTTP transports (default `8000`). |
+
+If no usable credentials are available for a call (no incoming `Authorization`
+header and no configured env credentials), the tool returns a clear error — the
+server itself still starts fine.
 
 ## Running
 
-The server communicates over stdio. Run it with `uv` from the project directory:
+### Locally over stdio (default)
 
 ```bash
 GOCANVAS_CLIENT_ID=... GOCANVAS_CLIENT_SECRET=... uv run server.py
 ```
+
+### Publicly over HTTP (e.g. Microsoft 365 Copilot custom agent, AWS Lambda)
+
+Run with an HTTP transport and **no** GoCanvas credentials — the agent's OAuth
+bearer token is forwarded per request:
+
+```bash
+GOCANVAS_TRANSPORT=streamable-http GOCANVAS_HOST=0.0.0.0 GOCANVAS_PORT=8000 uv run server.py
+```
+
+The MCP endpoint is served at `/mcp`. Point your 365 Copilot custom agent's MCP
+connection at the public URL and configure its OAuth so it obtains a GoCanvas
+token; that token is passed through to the GoCanvas API on every tool call. No
+PDFs or other state are written to disk, so the server runs cleanly on read-only
+/ ephemeral hosts.
 
 ### MCP client configuration
 
